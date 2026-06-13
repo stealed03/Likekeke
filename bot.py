@@ -271,11 +271,15 @@ LIMIT_PATTERNS = [
     r"next reset",
     r"you can try again after reset",
 ]
+COOLDOWN_PATTERN = r"please wait (\d+) seconds"
 
 def detect_response(text: str):
     t = text.lower()
     if any(re.search(p, t) for p in SUCCESS_PATTERNS):
         return "success"
+    cd = re.search(COOLDOWN_PATTERN, t)
+    if cd:
+        return ("cooldown", int(cd.group(1)))
     if any(re.search(p, t) for p in LIMIT_PATTERNS):
         return "limit"
     return "unknown"
@@ -332,11 +336,21 @@ async def run_task(uid: int):
 
             result_holder = {"text": None, "event": asyncio.Event()}
 
-            @client.on(events.NewMessage(from_users=target))
+            @client.on(events.NewMessage(incoming=True))
             async def handler(event):
-                if not result_holder["event"].is_set():
-                    result_holder["text"] = event.raw_text
-                    result_holder["event"].set()
+                try:
+                    sender = await event.get_sender()
+                    sender_username = getattr(sender, 'username', '') or ''
+                    sender_first    = getattr(sender, 'first_name', '') or ''
+                    # Match by username or first_name (case insensitive)
+                    if (target.lower() in sender_username.lower() or
+                        target.lower() in sender_first.lower() or
+                        sender_username.lower() in target.lower()):
+                        if not result_holder["event"].is_set():
+                            result_holder["text"] = event.raw_text
+                            result_holder["event"].set()
+                except Exception:
+                    pass
 
             await client.send_message(target, msg_text)
             log.info(f"[{uid}] Sent → @{target}: {msg_text}")
@@ -351,6 +365,15 @@ async def run_task(uid: int):
 
             reply_text = result_holder["text"]
             status     = detect_response(reply_text)
+
+            # Cooldown tuple handle
+            if isinstance(status, tuple) and status[0] == "cooldown":
+                wait_sec = status[1] + 5  # thoda extra buffer
+                log.info(f"[{uid}] Cooldown {status[1]}s — waiting {wait_sec}s")
+                await client.disconnect()
+                await asyncio.sleep(wait_sec)
+                continue
+
             log.info(f"[{uid}] Status: {status}")
 
             if status == "success":
@@ -390,9 +413,16 @@ async def run_task(uid: int):
                         log.warning(f"[{uid}] Notify failed @{notify}: {ne}")
 
                 await client.disconnect()
-                wait_sec = seconds_until(next_run)
-                await asyncio.sleep(wait_sec)
-                upsert_user(uid, next_run=None)
+                # Sleep until next 4 AM — check every 60s for stop signal
+                while True:
+                    u2 = get_user(uid)
+                    if not u2 or not u2["task_active"]:
+                        break
+                    remaining = seconds_until(next_run)
+                    if remaining <= 0:
+                        upsert_user(uid, next_run=None)
+                        break
+                    await asyncio.sleep(min(remaining, 60))
 
             else:
                 # Silent retry — smart interval near 4 AM
