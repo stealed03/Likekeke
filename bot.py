@@ -323,31 +323,40 @@ async def run_task(uid: int):
             await client.send_message(target, msg_text)
             log.info(f"[{uid}] Sent → @{target}: {msg_text} at {sent_at.strftime('%H:%M:%S')}")
 
-            # Poll for response — only accept messages AFTER sent_at
+            # Poll for response — collect ALL new messages, pick FIRST one after sent_at
             reply_text = None
             for _ in range(15):
                 await asyncio.sleep(2)
                 try:
-                    async for msg in client.iter_messages(target, limit=5):
-                        # Skip messages older than when we sent
+                    new_msgs = []
+                    async for msg in client.iter_messages(target, limit=10):
+                        text = msg.raw_text or ""
+                        if not text:
+                            continue
                         msg_time = msg.date
                         if hasattr(msg_time, 'astimezone'):
                             msg_time = msg_time.astimezone(IST)
                         else:
                             from datetime import timezone
                             msg_time = msg_time.replace(tzinfo=timezone.utc).astimezone(IST)
-                        
                         if msg_time < sent_at:
-                            continue  # Purana message — skip!
-                        
-                        text = msg.raw_text or ""
+                            break  # Older than sent_at — stop
                         if any(k in text.lower() for k in KEYWORDS):
-                            reply_text = text
-                            log.info(f"[{uid}] Got (at {msg_time.strftime('%H:%M:%S')}): {text[:80]}")
-                            break
-                    if reply_text: break
+                            new_msgs.append((msg_time, text))
+
+                    if new_msgs:
+                        # Pick OLDEST new message (first response to our command)
+                        new_msgs.sort(key=lambda x: x[0])
+                        reply_text = new_msgs[0][1]
+                        log.info(f"[{uid}] Got (at {new_msgs[0][0].strftime('%H:%M:%S')}): {reply_text[:80]}")
+                        break
                 except Exception as e:
                     log.warning(f"[{uid}] Poll: {e}")
+
+            # Disconnect IMMEDIATELY after getting reply — no more sends
+            try:
+                await client.disconnect()
+            except: pass
 
             if not reply_text:
                 log.warning(f"[{uid}] No response, retry 60s")
@@ -400,7 +409,7 @@ async def run_task(uid: int):
                             f"👤 {info.get('nickname','—')} | +{info.get('given','—')}", parse_mode="HTML")
                     except: pass
 
-                await client.disconnect()
+                # Client already disconnected above
                 while True:
                     u2 = get_user(uid)
                     if not u2 or not u2["task_active"]: break
@@ -410,7 +419,6 @@ async def run_task(uid: int):
                     await asyncio.sleep(min(rem, 60))
 
             else:
-                await client.disconnect()
                 wait_sec = smart_retry_seconds(retry_m)
                 log.info(f"[{uid}] Limit — retry {wait_sec//60}m")
                 await asyncio.sleep(wait_sec)
